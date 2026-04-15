@@ -18,6 +18,17 @@ class AzureOpenAIConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    llm_provider: str
+    model_name: str
+    azure_endpoint: str | None = None
+    azure_api_key: str | None = None
+    deployment_name: str | None = None
+    api_version: str | None = None
+    groq_api_key: str | None = None
+
+
+@dataclass(frozen=True)
 class GitHubConnectionConfig:
     git_id: int | None
     application_id: int | None
@@ -118,6 +129,43 @@ def resolve_azure_openai_config(config: Any) -> AzureOpenAIConfig:
         api_version=api_version,
         model_name=model_name,
     )
+
+
+def resolve_llm_config(config: Any) -> LLMConfig:
+    llm_provider = (_read_value(config, "llm_provider") or _read_value(config, "provider") or "azure_openai").strip().lower()
+
+    if llm_provider == "azure_openai":
+        azure = resolve_azure_openai_config(config)
+        return LLMConfig(
+            llm_provider=llm_provider,
+            model_name=azure.model_name,
+            azure_endpoint=azure.azure_endpoint,
+            azure_api_key=azure.azure_api_key,
+            deployment_name=azure.deployment_name,
+            api_version=azure.api_version,
+        )
+
+    if llm_provider == "groq":
+        groq_api_key = _read_value(config, "groq_api_key") or _read_value(config, "api_key")
+        model_name = _read_value(config, "model_name")
+        missing = [
+            name for name, value in [
+                ("groq_api_key", groq_api_key),
+                ("model_name", model_name),
+            ]
+            if not value
+        ]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(f"Missing Groq settings: {joined}")
+
+        return LLMConfig(
+            llm_provider=llm_provider,
+            model_name=model_name,
+            groq_api_key=groq_api_key,
+        )
+
+    raise ValueError("Unsupported llm_provider. Supported values: azure_openai, groq")
 
 
 def resolve_git_connection(

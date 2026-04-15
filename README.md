@@ -1,6 +1,11 @@
 # GitHub Repository Intelligence Agent
 
-Streamlit-based multi-agent assistant for GitHub repositories, built with LangGraph, Azure OpenAI, and GitHub MCP tools.
+Streamlit-based multi-agent assistant for GitHub repositories, built with LangGraph, Azure OpenAI/Groq, and GitHub MCP tools.
+
+## Architecture + License
+
+- Detailed architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
+- License: [LICENSE](LICENSE) (MIT)
 
 ## What This Project Does
 
@@ -182,4 +187,3 @@ The graph state tracks:
 2. Convert local absolute imports to package-relative imports for cleaner module execution.
 3. Add unit tests for routing/orchestrator behavior and config resolution.
 4. Add structured tool-result schemas to improve synthesizer reliability.
-

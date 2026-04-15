@@ -1,30 +1,27 @@
-import streamlit as st
-import logging
 import json
-from mcp_connection import get_tools_sync, get_tools_for_connection_sync
-from graph import build_graph, build_graph_from_llm_config, run_query, run_query_for_connection
+import logging
+
+import streamlit as st
+
+from graph import build_graph_from_llm_config, run_query, run_query_for_connection
+from mcp_connection import get_tools_for_connection_sync, get_tools_sync
 from runtime_context import resolve_git_connection
 
-# ─────────────────────────────────────────────
-# LOGGING SETUP — captures logs into Streamlit
-# ─────────────────────────────────────────────
+
 class StreamlitLogHandler(logging.Handler):
-    """Custom handler that stores logs in session state."""
+    """Store logs in Streamlit session state."""
+
     def emit(self, record):
         if "logs" not in st.session_state:
             st.session_state.logs = []
-        msg = self.format(record)
-        st.session_state.logs.append(msg)
+        st.session_state.logs.append(self.format(record))
 
-# Setup root logger
+
 log_handler = StreamlitLogHandler()
 log_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[
-        log_handler,
-        logging.StreamHandler()   # also print to terminal
-    ]
+    handlers=[log_handler, logging.StreamHandler()],
 )
 
 
@@ -44,30 +41,41 @@ def build_metrics_caption(run_result: dict) -> str:
         f"Est. Cost: {format_currency(cost)}"
     )
 
-# ─────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────
+
 st.set_page_config(page_title="GitHub Repo Agent", page_icon="🤖", layout="wide")
 st.title("🤖 GitHub Repository Intelligence Agent")
-st.caption("Powered by LangGraph + Azure OpenAI + GitHub MCP")
+st.caption("Powered by LangGraph + Azure OpenAI/Groq + GitHub MCP")
 
-# ─────────────────────────────────────────────
-# SIDEBAR — CREDENTIALS
-# ─────────────────────────────────────────────
+
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("Configuration")
 
-    st.subheader("🔵 Azure OpenAI")
-    azure_endpoint  = st.text_input("Azure Endpoint", value="https://YOUR_RESOURCE.openai.azure.com/")
-    azure_api_key   = st.text_input("Azure API Key", value="", type="password")
-    deployment_name = st.text_input("Deployment Name", value="gpt-4o")
-    model_name      = st.text_input("Model Name", value="gpt-4o")
-    api_version     = st.text_input("API Version", value="2024-02-01")
+    st.subheader("LLM")
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        options=["azure_openai", "groq"],
+        format_func=lambda provider: "Azure OpenAI" if provider == "azure_openai" else "Groq",
+    )
+
+    if llm_provider == "azure_openai":
+        azure_endpoint = st.text_input("Azure Endpoint", value="https://YOUR_RESOURCE.openai.azure.com/")
+        azure_api_key = st.text_input("Azure API Key", value="", type="password")
+        deployment_name = st.text_input("Deployment Name", value="gpt-4o")
+        model_name = st.text_input("Model Name", value="gpt-4o")
+        api_version = st.text_input("API Version", value="2024-02-01")
+        groq_api_key = ""
+    else:
+        groq_api_key = st.text_input("Groq API Key", value="", type="password")
+        model_name = st.text_input("Groq Model Name", value="llama-3.3-70b-versatile")
+        azure_endpoint = ""
+        azure_api_key = ""
+        deployment_name = ""
+        api_version = ""
 
     st.divider()
 
-    st.subheader("🔗 GitHub MCP Server")
-    mcp_url     = st.text_input("MCP Server URL", value="https://api.githubcopilot.com/mcp/")
+    st.subheader("GitHub MCP Server")
+    mcp_url = st.text_input("MCP Server URL", value="https://api.githubcopilot.com/mcp/")
     mcp_api_key = st.text_input("MCP API Key / GitHub Token", value="", type="password")
     git_connection_payload = st.text_area(
         "GitConnection Row JSON",
@@ -77,7 +85,7 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("🧭 LangSmith")
+    st.subheader("LangSmith")
     enable_langsmith = st.checkbox("Enable LangSmith tracing", value=False)
     langsmith_project = st.text_input("LangSmith Project", value="github-repo-agent")
     langsmith_api_url = st.text_input("LangSmith API URL", value="https://api.smith.langchain.com")
@@ -86,15 +94,13 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("📁 Repository")
+    st.subheader("Repository")
     repo_owner = st.text_input("Repo Owner", value="")
-    repo_name  = st.text_input("Repo Name", value="")
+    repo_name = st.text_input("Repo Name", value="")
 
-    connect_btn = st.button("🔌 Connect & Load Tools", type="primary")
+    connect_btn = st.button("Connect & Load Tools", type="primary")
 
-# ─────────────────────────────────────────────
-# SESSION STATE
-# ─────────────────────────────────────────────
+
 for key, default in [
     ("tools_loaded", False),
     ("graph", None),
@@ -103,18 +109,37 @@ for key, default in [
     ("tools", []),
     ("last_run_metrics", None),
     ("connected_model_name", None),
+    ("connected_llm_provider", None),
     ("connected_git_connection", None),
     ("connected_repo_context", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ─────────────────────────────────────────────
-# CONNECT
-# ─────────────────────────────────────────────
+
 if connect_btn:
     git_connection = None
     repo_context = None
+
+    llm_config = {
+        "llm_provider": llm_provider,
+        "model_name": model_name,
+    }
+    if llm_provider == "azure_openai":
+        llm_config.update(
+            {
+                "azure_endpoint": azure_endpoint,
+                "azure_api_key": azure_api_key,
+                "deployment_name": deployment_name,
+                "api_version": api_version,
+            }
+        )
+        missing_llm = not all([azure_endpoint, azure_api_key, deployment_name, model_name, api_version])
+        llm_error = "Please fill all Azure OpenAI settings."
+    else:
+        llm_config.update({"groq_api_key": groq_api_key})
+        missing_llm = not all([groq_api_key, model_name])
+        llm_error = "Please fill all Groq settings."
 
     if git_connection_payload.strip():
         try:
@@ -127,11 +152,10 @@ if connect_btn:
         except Exception as exc:
             st.sidebar.error(f"Invalid GitConnection payload: {exc}")
 
-    missing_azure = not all([azure_endpoint, azure_api_key, deployment_name, model_name, api_version])
     missing_mcp = not git_connection and not all([mcp_url, mcp_api_key])
 
-    if missing_azure:
-        st.sidebar.error("Please fill all Azure OpenAI settings.")
+    if missing_llm:
+        st.sidebar.error(llm_error)
     elif missing_mcp:
         st.sidebar.error("Please fill MCP URL and token, or provide a GitConnection JSON payload.")
     else:
@@ -145,58 +169,38 @@ if connect_btn:
                             mcp_url=mcp_url or None,
                             github_token=mcp_api_key or None,
                         )
-                        graph = build_graph_from_llm_config(
-                            {
-                                "azure_endpoint": azure_endpoint,
-                                "azure_api_key": azure_api_key,
-                                "deployment_name": deployment_name,
-                                "api_version": api_version,
-                                "model_name": model_name,
-                            },
-                            all_tools=tools,
-                        )
                     else:
                         tools = get_tools_sync(mcp_url, mcp_api_key)
-                        graph = build_graph(
-                            azure_endpoint=azure_endpoint,
-                            azure_api_key=azure_api_key,
-                            deployment_name=deployment_name,
-                            api_version=api_version,
-                            model_name=model_name,
-                            all_tools=tools
-                        )
+
+                    graph = build_graph_from_llm_config(llm_config, all_tools=tools)
+
                     st.session_state.tools_loaded = True
                     st.session_state.graph = graph
                     st.session_state.tools = tools
                     st.session_state.last_run_metrics = None
                     st.session_state.connected_model_name = model_name
-                    st.success(f"✅ Connected! {len(tools)} tools loaded.")
+                    st.session_state.connected_llm_provider = llm_provider
                     st.session_state.connected_git_connection = git_connection
                     st.session_state.connected_repo_context = repo_context.safe_metadata() if repo_context else None
+
+                    st.success(f"Connected! {len(tools)} tools loaded.")
                     if repo_context:
                         st.caption(f"Repo resolved from GitConnection: {repo_context.repo_full_name}")
                     with st.expander("Tools loaded"):
                         st.write([t.name for t in tools])
-                except Exception as e:
-                    st.error(f"Connection failed: {e}")
-                    logging.error(f"[CONNECT] Failed: {e}")
+                except Exception as exc:
+                    st.error(f"Connection failed: {exc}")
+                    logging.error(f"[CONNECT] Failed: {exc}")
 
-# ─────────────────────────────────────────────
-# MAIN LAYOUT — 3 columns
-# ─────────────────────────────────────────────
+
 col_chat, col_status, col_logs = st.columns([2, 1, 1])
 
-# ── CHAT COLUMN ──────────────────────────────
 with col_chat:
-    st.subheader("💬 Ask Anything About the Repo")
+    st.subheader("Ask Anything About the Repo")
 
     examples = [
-        "What tech stack is used?", "List all API endpoints"
-        # "What bugs are open?", "Show recent commits",
-        # "What PRs are open?", "Find all env variables",
-        # "Who are the contributors?", "What is the business flow?",
-        # "Any secrets exposed?", "What is the latest version?",
-        # "Find all database models", "What auth mechanism is used?"
+        "What tech stack is used?",
+        "List all API endpoints",
     ]
 
     st.caption("Quick queries:")
@@ -231,7 +235,7 @@ with col_chat:
         elif enable_langsmith and not langsmith_api_key:
             st.error("Please enter a LangSmith API key or disable tracing.")
         else:
-            st.session_state.logs = []   # clear logs for new query
+            st.session_state.logs = []
             active_model_name = st.session_state.connected_model_name or model_name
             tracing_config = {
                 "enabled": enable_langsmith,
@@ -245,7 +249,7 @@ with col_chat:
                 st.write(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("🤖 Agent thinking and executing..."):
+                with st.spinner("Agent thinking and executing..."):
                     try:
                         if st.session_state.connected_git_connection:
                             run_result = run_query_for_connection(
@@ -266,30 +270,35 @@ with col_chat:
                                 model_name=active_model_name,
                                 tracing_config=tracing_config,
                             )
+
                         answer = run_result["answer"]
                         st.markdown(answer)
                         st.caption(build_metrics_caption(run_result))
                         if run_result.get("trace_url"):
                             st.markdown(f"[Open LangSmith trace]({run_result['trace_url']})")
-                        st.session_state.last_run_metrics = run_result
-                        st.session_state.chat_history.append({
-                            "query": user_input,
-                            "answer": answer,
-                            "metrics": run_result,
-                            "trace_url": run_result.get("trace_url"),
-                        })
-                    except Exception as e:
-                        st.error(f"Agent error: {e}")
-                        logging.error(f"[UI] Agent error: {e}", exc_info=True)
 
-# ── STATUS COLUMN ─────────────────────────────
+                        st.session_state.last_run_metrics = run_result
+                        st.session_state.chat_history.append(
+                            {
+                                "query": user_input,
+                                "answer": answer,
+                                "metrics": run_result,
+                                "trace_url": run_result.get("trace_url"),
+                            }
+                        )
+                    except Exception as exc:
+                        st.error(f"Agent error: {exc}")
+                        logging.error(f"[UI] Agent error: {exc}", exc_info=True)
+
 with col_status:
-    st.subheader("📊 Agent Status")
+    st.subheader("Agent Status")
 
     if st.session_state.tools_loaded:
-        st.success("🟢 Connected")
+        st.success("Connected")
         st.metric("Tools Loaded", len(st.session_state.tools))
         st.metric("Queries Run", len(st.session_state.chat_history))
+        if st.session_state.connected_llm_provider:
+            st.caption(f"Provider: {st.session_state.connected_llm_provider}")
         if st.session_state.connected_model_name:
             st.caption(f"Model: {st.session_state.connected_model_name}")
         if st.session_state.connected_repo_context:
@@ -301,56 +310,59 @@ with col_status:
         if last_run_metrics:
             totals = last_run_metrics.get("usage", {}).get("totals", {})
             st.divider()
-            st.subheader("🧮 Last Run")
+            st.subheader("Last Run")
             st.metric("Input Tokens", f"{int(totals.get('input_tokens', 0)):,}")
             st.metric("Output Tokens", f"{int(totals.get('output_tokens', 0)):,}")
             st.metric("Total Tokens", f"{int(totals.get('total_tokens', 0)):,}")
-            st.metric(
-                "Est. Cost",
-                format_currency(last_run_metrics.get("cost", {}).get("estimated_cost_usd")),
-            )
+            st.metric("Est. Cost", format_currency(last_run_metrics.get("cost", {}).get("estimated_cost_usd")))
             if last_run_metrics.get("trace_project"):
                 st.caption(f"LangSmith Project: {last_run_metrics['trace_project']}")
             if last_run_metrics.get("trace_url"):
                 st.markdown(f"[Open LangSmith trace]({last_run_metrics['trace_url']})")
 
-        st.subheader("🛠️ Nodes")
-        for node in ["🔍 Repo Analyst", "💻 Code Analyst", "🔀 PR Node",
-                     "🐛 Issues Node", "👥 Team Node", "🔐 Security Node",
-                     "🤖 Copilot Node", "✏️ Write Ops", "🌐 Meta Node"]:
+        st.subheader("Nodes")
+        for node in [
+            "Repo Analyst",
+            "Code Analyst",
+            "PR Node",
+            "Issues Node",
+            "Team Node",
+            "Security Node",
+            "Copilot Node",
+            "Write Ops",
+            "Meta Node",
+        ]:
             st.caption(node)
     else:
-        st.warning("🔴 Not Connected")
+        st.warning("Not Connected")
 
     if st.session_state.chat_history:
         st.divider()
-        st.subheader("📜 History")
-        for i, chat in enumerate(reversed(st.session_state.chat_history[-5:])):
+        st.subheader("History")
+        for chat in reversed(st.session_state.chat_history[-5:]):
             st.caption(f"Q: {chat['query'][:40]}...")
-        if st.button("🗑️ Clear History"):
+        if st.button("Clear History"):
             st.session_state.chat_history = []
             st.session_state.last_run_metrics = None
             st.rerun()
 
-# ── LOGS COLUMN ───────────────────────────────
 with col_logs:
-    st.subheader("📋 Live Agent Logs")
+    st.subheader("Live Agent Logs")
 
-    if st.button("🔄 Refresh Logs"):
+    if st.button("Refresh Logs"):
         st.rerun()
 
-    if st.button("🗑️ Clear Logs"):
+    if st.button("Clear Logs"):
         st.session_state.logs = []
         st.rerun()
 
     logs = st.session_state.get("logs", [])
     if logs:
-        log_text = "\n".join(logs)
         st.text_area(
             label="Logs",
-            value=log_text,
+            value="\n".join(logs),
             height=600,
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
     else:
         st.info("Logs will appear here when agent runs.")

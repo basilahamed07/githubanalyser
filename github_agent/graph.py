@@ -13,7 +13,7 @@ from agent_nodes import (
     issues_node, team_node, security_node, copilot_node,
     write_ops_node, meta_node, synthesizer_node, get_llm
 )
-from runtime_context import resolve_azure_openai_config, resolve_git_connection
+from runtime_context import resolve_git_connection, resolve_llm_config
 from tracking import estimate_usage_cost, summarize_usage_metadata
 
 logger = logging.getLogger(__name__)
@@ -42,15 +42,27 @@ def router_edge(state: dict) -> str:
     return next_node
 
 
-def build_graph(azure_endpoint, azure_api_key, deployment_name, api_version, model_name, all_tools):
+def build_graph(
+    azure_endpoint=None,
+    azure_api_key=None,
+    deployment_name=None,
+    api_version=None,
+    model_name=None,
+    all_tools=None,
+    llm_provider="azure_openai",
+    groq_api_key=None,
+):
     logger.info("[GRAPH] Building LangGraph agent...")
 
+    tracked_model_name = model_name or deployment_name
     llm = get_llm(
-        azure_endpoint,
-        azure_api_key,
-        deployment_name,
-        api_version,
-        model_name,
+        azure_endpoint=azure_endpoint,
+        azure_api_key=azure_api_key,
+        deployment_name=deployment_name,
+        api_version=api_version,
+        model_name=tracked_model_name,
+        llm_provider=llm_provider,
+        groq_api_key=groq_api_key,
     )
 
     # Wrap async nodes with partial for dependency injection
@@ -113,19 +125,22 @@ def build_graph(azure_endpoint, azure_api_key, deployment_name, api_version, mod
     graph.add_edge("synthesizer", END)
 
     compiled = graph.compile()
-    setattr(compiled, "_github_agent_model_name", model_name)
+    setattr(compiled, "_github_agent_model_name", tracked_model_name)
+    setattr(compiled, "_github_agent_llm_provider", llm_provider)
     logger.info("[GRAPH] Graph compiled successfully")
     return compiled
 
 
 def build_graph_from_llm_config(llm_config, all_tools):
-    resolved = resolve_azure_openai_config(llm_config)
+    resolved = resolve_llm_config(llm_config)
     return build_graph(
+        llm_provider=resolved.llm_provider,
+        model_name=resolved.model_name,
         azure_endpoint=resolved.azure_endpoint,
         azure_api_key=resolved.azure_api_key,
         deployment_name=resolved.deployment_name,
         api_version=resolved.api_version,
-        model_name=resolved.model_name,
+        groq_api_key=resolved.groq_api_key,
         all_tools=all_tools,
     )
 

@@ -1,25 +1,84 @@
 import logging
 from functools import partial
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
-from langchain_openai import AzureChatOpenAI
 
 logger = logging.getLogger(__name__)
 
+ORCHESTRATOR_TREE_MAX_CHARS = 5000
+ORCHESTRATOR_LAST_RESULT_MAX_CHARS = 2000
+ORCHESTRATOR_PLAN_MAX_CHARS = 2500
+ORCHESTRATOR_RESULTS_KEYS_MAX_ITEMS = 80
+ORCHESTRATOR_FAILED_KEYS_MAX_ITEMS = 30
+ORCHESTRATOR_CONTEXT_MAX_CHARS = 12000
 
-def get_llm(azure_endpoint, azure_api_key, deployment_name, api_version, model_name):
-    tracked_model_name = model_name or deployment_name
-    logger.info(
-        f"[LLM] Creating AzureChatOpenAI for deployment={deployment_name} model={tracked_model_name}"
-    )
-    return AzureChatOpenAI(
-        azure_endpoint=azure_endpoint,
-        api_key=azure_api_key,
-        azure_deployment=deployment_name,
-        api_version=api_version,
-        model=tracked_model_name,
-        temperature=0,
-        streaming=False
-    )
+SPECIALIST_TOOL_RESULT_MAX_CHARS = 3000
+SPECIALIST_STORED_RESULT_MAX_CHARS = 12000
+SPECIALIST_MAX_INTERMEDIATE_RESULTS = 30
+
+SYNTHESIZER_MAX_RESULTS = 6
+SYNTHESIZER_RESULT_CHUNK_MAX_CHARS = 2500
+SYNTHESIZER_CONTEXT_MAX_CHARS = 14000
+
+
+def _truncate_text(value, max_chars: int) -> str:
+    text = str(value) if value is not None else ""
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return f"{text[:max_chars]}\n\n[TRUNCATED {omitted} chars]"
+
+
+def _compact_sequence(values, max_items: int) -> str:
+    items = list(values)
+    if len(items) <= max_items:
+        return str(items)
+    head_count = max_items // 2
+    tail_count = max_items - head_count
+    compact = items[:head_count] + ["..."] + items[-tail_count:]
+    omitted = len(items) - (head_count + tail_count)
+    return f"{compact} (omitted {omitted} items)"
+
+
+def get_llm(
+    azure_endpoint=None,
+    azure_api_key=None,
+    deployment_name=None,
+    api_version=None,
+    model_name=None,
+    *,
+    llm_provider="azure_openai",
+    groq_api_key=None,
+):
+    provider = (llm_provider or "azure_openai").strip().lower()
+
+    if provider == "azure_openai":
+        tracked_model_name = model_name or deployment_name
+        logger.info(
+            f"[LLM] Creating Azure OpenAI chat model for deployment={deployment_name} model={tracked_model_name}"
+        )
+        return init_chat_model(
+            model=tracked_model_name,
+            model_provider="azure_openai",
+            azure_endpoint=azure_endpoint,
+            api_key=azure_api_key,
+            azure_deployment=deployment_name,
+            api_version=api_version,
+            temperature=0,
+            streaming=False,
+        )
+
+    if provider == "groq":
+        logger.info(f"[LLM] Creating Groq chat model for model={model_name}")
+        return init_chat_model(
+            model=model_name,
+            model_provider="groq",
+            api_key=groq_api_key,
+            temperature=0,
+            max_tokens=1024,
+        )
+
+    raise ValueError("Unsupported llm_provider. Supported values: azure_openai, groq")
 
 
 def filter_tools(all_tools: list, tool_names: list):
@@ -187,18 +246,18 @@ async def orchestrator_node(state: dict, llm) -> dict:
             "_stuck_count": stuck_count,
         }
 
-    # ── Extract full tree result (never truncate it) ──
+    # ── Extract tree result for planning context (trimmed to stay under provider limits) ──
     tree_result = ""
     for k, v in intermediate.items():
         if "tree_scan" in k:
-            tree_result = str(v)
+            tree_result = _truncate_text(v, ORCHESTRATOR_TREE_MAX_CHARS)
             break
 
     # ── Last tool result for context ──
     last_result = ""
     if intermediate:
         last_val = list(intermediate.values())[-1]
-        last_result = str(last_val)[:4000]
+        last_result = _truncate_text(last_val, ORCHESTRATOR_LAST_RESULT_MAX_CHARS)
 
     # ── Collect failed result keys so orchestrator knows what not to retry ──
     failed_keys = [
@@ -261,21 +320,22 @@ Repo: {state.get('repo_owner')}/{state.get('repo_name')}
 Intent: {state.get('intent')}
 Loop Count: {loop_count}
 
-REPO FILE TREE (FULL — use ONLY these exact paths):
+REPO FILE TREE (trimmed):
 {tree_result}
 
 EXISTING PLAN (carry forward ALL steps, mark done, add new pending):
-{existing_plan}
+{_truncate_text(existing_plan, ORCHESTRATOR_PLAN_MAX_CHARS)}
 
 Results Already Collected (DO NOT re-read these — data already available):
-{list(intermediate.keys())}
+{_compact_sequence(intermediate.keys(), ORCHESTRATOR_RESULTS_KEYS_MAX_ITEMS)}
 
 FAILED RESULT KEYS — DO NOT RETRY THESE PATHS (they returned errors or 404):
-{failed_keys}
+{_compact_sequence(failed_keys, ORCHESTRATOR_FAILED_KEYS_MAX_ITEMS)}
 
 Last Tool Result (most recent — read carefully to decide next step):
 {last_result}
 """
+    context = _truncate_text(context, ORCHESTRATOR_CONTEXT_MAX_CHARS)
 
     response = await llm.ainvoke([system, HumanMessage(content=context)])
     logger.info(f"[ORCHESTRATOR] Response: {response.content[:800]}")
@@ -366,8 +426,13 @@ async def run_specialist_node(
 
     all_content = response.content or ""
     for tm in tool_messages:
-        all_content += f"\n\nTool Result:\n{tm.content}"
-        logger.info(f"[{node_name.upper()}] Tool result collected, length={len(tm.content)}")
+        trimmed_tool_content = _truncate_text(tm.content, SPECIALIST_TOOL_RESULT_MAX_CHARS)
+        all_content += f"\n\nTool Result:\n{trimmed_tool_content}"
+        logger.info(
+            f"[{node_name.upper()}] Tool result collected, raw={len(str(tm.content))}, kept={len(trimmed_tool_content)}"
+        )
+
+    all_content = _truncate_text(all_content, SPECIALIST_STORED_RESULT_MAX_CHARS)
 
     # ── Append loop_count so retried steps don't overwrite previous results ──
     if purpose:
@@ -377,6 +442,9 @@ async def run_specialist_node(
 
     results = state.get("intermediate_results", {})
     results[result_key] = all_content
+    if len(results) > SPECIALIST_MAX_INTERMEDIATE_RESULTS:
+        # Keep only the latest N entries so future prompts don't exceed provider token limits.
+        results = dict(list(results.items())[-SPECIALIST_MAX_INTERMEDIATE_RESULTS:])
 
     logger.info(f"[{node_name.upper()}] Done | stored key: {result_key} | content length: {len(all_content)}")
 
@@ -566,11 +634,12 @@ Rules:
 6. For API endpoints: present as a clean table with Method | Path | Description
 """)
 
-    # ── Pass full intermediate results but cap per-result to avoid token overflow ──
+    # ── Pass only recent intermediate results and cap per-result to avoid token overflow ──
     all_data = state.get("intermediate_results", {})
     data_str = ""
-    for k, v in all_data.items():
-        chunk = str(v)[:8000]
+    selected_items = list(all_data.items())[-SYNTHESIZER_MAX_RESULTS:]
+    for k, v in selected_items:
+        chunk = _truncate_text(v, SYNTHESIZER_RESULT_CHUNK_MAX_CHARS)
         data_str += f"\n\n--- {k} ---\n{chunk}"
 
     context = f"""\
@@ -578,9 +647,10 @@ Original Query: {state['user_query']}
 Repo: {state.get('repo_owner')}/{state.get('repo_name')}
 Tools Used: {state.get('tool_calls_made', [])}
 
-All Collected Data:
+Collected Data (recent, trimmed):
 {data_str}
 """
+    context = _truncate_text(context, SYNTHESIZER_CONTEXT_MAX_CHARS)
 
     response = await llm.ainvoke([system, HumanMessage(content=context)])
     logger.info(f"[SYNTHESIZER] Final answer length: {len(response.content)}")
